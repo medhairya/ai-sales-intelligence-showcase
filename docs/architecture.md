@@ -1,76 +1,63 @@
-# Architecture
+# Design decisions
 
-High-level view of the client platform. Component names are generic; no client
-systems, schemas or data are shown.
+The diagrams live in the [README](../README.md). This page records *why* the
+gateway is built the way it is, in the form of short decision records.
 
-```mermaid
-flowchart LR
-    subgraph Clients
-        W[Web dashboard<br/>real-time KPIs]
-        C[Chat interface<br/>natural-language queries]
-        V[Voice agent<br/>streaming STT / TTS]
-    end
+## ADR-1: Token bucket for rate limiting
 
-    subgraph Backend["Backend (FastAPI on AWS)"]
-        API[REST API]
-        GW[LLM Gateway<br/>rate limit + guardrails<br/>+ retry + metrics]
-        AG[Multi-agent workflows]
-        PIPE[Analytics pipelines<br/>scheduled jobs]
-    end
+**Context.** Users send messages in short bursts (a few quick questions), but
+the provider quota is a sustained per-minute limit.
 
-    subgraph Data
-        DB[(MongoDB)]
-        R[(Redis cache)]
-    end
+**Decision.** Per-client token bucket (capacity `C`, refill `r`).
 
-    LLM[[LLM provider]]
+**Alternatives.** A fixed window is simpler but allows 2× traffic at window
+boundaries. A sliding log is exact but stores one timestamp per request.
 
-    W --> API
-    C --> API
-    V --> API
-    API --> AG --> GW --> LLM
-    API --> DB
-    API --> R
-    PIPE --> DB
-    W -. websocket .- API
-```
+**Consequences.** Two numbers per client, O(1) per check, bursts tunable
+separately from the sustained rate. The in-memory store is per-instance; a
+`RateLimiter` backed by Redis is needed for horizontal scaling.
 
-## What lives in this repo
+## ADR-2: Guardrails in both directions
 
-Only the **LLM Gateway** box above is published here, as a clean-room
-reimplementation:
+**Context.** Prompts contain customer contact details, and models can repeat
+anything that appears in their context.
 
-| Module | Responsibility |
-|---|---|
-| `app/rate_limiter.py` | Per-client token bucket: bursts allowed, sustained rate capped |
-| `app/guardrails.py` | Blocks empty, oversized and prompt-injection inputs; redacts PII in and out |
-| `app/llm_client.py` | Provider interface (proxy layer) with exponential-backoff retries |
-| `app/monitoring.py` | Request counters, success rate, p50/p95/p99 latency |
-| `app/main.py` | FastAPI app wiring the above into `POST /v1/chat` |
+**Decision.** Redact emails and phone numbers on input *and* output. Reject
+empty, oversized and known-injection prompts before calling the model.
 
-## Request lifecycle
+**Consequences.** PII never leaves the network and never comes back to the
+user. Regex-based injection detection is a cheap first line, not a complete
+defence; it is paired with least-privilege tool access in the agent layer.
 
-```mermaid
-sequenceDiagram
-    participant U as Client
-    participant G as Gateway
-    participant P as LLM provider
-    U->>G: POST /v1/chat
-    G->>G: rate limit check (429 if exceeded)
-    G->>G: input guardrails (400 if blocked, redact PII)
-    G->>P: completion request (retry w/ backoff)
-    P-->>G: reply (502 if all retries fail)
-    G->>G: output guardrails, record metrics
-    G-->>U: 200 { reply, redactions, latency_ms }
-```
+## ADR-3: Provider behind an interface
 
-## Design decisions
+**Context.** Models and vendors change, and CI must not depend on a paid API.
 
-- **Token bucket over fixed window**: avoids the burst-at-window-edge problem
-  and lets genuine users send a few quick messages without being throttled.
-- **Provider interface**: business logic never imports a vendor SDK, so the
-  upstream model can be switched or mocked (CI runs fully offline).
-- **Guardrails both ways**: PII is stripped before it leaves the network and
-  again from model output, since models can echo data from context.
-- **Dependency injection in `create_app`**: tests swap in fake providers,
-  limiters and settings without patching globals.
+**Decision.** Business logic depends only on the `LLMProvider` protocol.
+`MockProvider` is the default; `OpenAIProvider` targets any OpenAI-compatible
+endpoint.
+
+**Consequences.** Swapping vendors is a config change. The full test suite runs
+offline in under a second.
+
+## ADR-4: Bounded retries with exponential backoff
+
+**Context.** Provider errors are mostly short blips, but sometimes full outages.
+
+**Decision.** Retry up to `UPSTREAM_MAX_RETRIES` times with delays
+0.5 s × 2^k, then return `502`.
+
+**Consequences.** Short blips are invisible to users. During a real outage the
+gateway fails within a few seconds instead of hammering the provider. A circuit
+breaker is the planned next step.
+
+## ADR-5: App factory with dependency injection
+
+**Context.** Tests need fake providers, fake clocks and small limits without
+patching globals.
+
+**Decision.** `create_app(settings, provider, limiter)` builds the app; the
+module-level `app` uses environment settings.
+
+**Consequences.** Each test builds an isolated app. Production and tests use
+exactly the same request pipeline.
